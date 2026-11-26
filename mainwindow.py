@@ -41,8 +41,12 @@ def sources_mtime() -> float:
 class MainWindow(QWidget):
     W_MAX, H_MAX = 1180, 772
 
-    def __init__(self):
+    def __init__(self, on_stage=None):
+        """on_stage(进度 0~1, 状态文案)：启动画面的阶段进度回调，可为 None。"""
         super().__init__()
+        self._on_stage = on_stage
+        self._stage(0.08, "正在读取本地数据…")
+
         self.store = Store()
         self.store.migrate_legacy()
         self.store.seed_demo()
@@ -60,9 +64,11 @@ class MainWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
+        self._stage(0.18, "正在布置界面…")
         self._build()
         self._resize()
         self.refresh()
+        self._stage(0.96, "正在启动提醒服务…")
 
         # 卡片上的「还剩多久」每 10 秒就地刷新，不重建列表
         self._left_timer = QTimer(self)
@@ -74,6 +80,11 @@ class MainWindow(QWidget):
         self.scheduler.start()
 
     # ================================================================ 界面
+    def _stage(self, value: float, text: str | None = None) -> None:
+        """向启动画面汇报进度；构建期间这里会把界面帧刷出去，进度条才动得起来。"""
+        if self._on_stage is not None:
+            self._on_stage(value, text)
+
     def _resize(self):
         screen = QGuiApplication.primaryScreen()
         geo = screen.availableGeometry() if screen else None
@@ -106,14 +117,18 @@ class MainWindow(QWidget):
         self.topbar.minimize.connect(self.showMinimized)
         self.topbar.close.connect(self.hide_to_tray)
         card_lay.addWidget(self.topbar)
+        self._stage(0.32, "正在布置界面…")
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
         body.addWidget(self._build_sidebar())
+        self._stage(0.48, "正在载入任务…")
+
         self.stack = QStackedWidget()
         self.stack.setObjectName("Stack")
         self.stack.addWidget(self._build_list_page())
+        self._stage(0.76, "正在渲染列表…")
         self.stack.addWidget(self._build_settings_page())
         body.addWidget(self.stack, 1)
         card_lay.addLayout(body, 1)

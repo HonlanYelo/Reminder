@@ -20,7 +20,7 @@ _IN_VENV = os.path.normcase(os.path.abspath(sys.executable)).startswith(
 
 
 def _relaunch_in_venv() -> None:
-    """当前解释器没装 PySide6 时，用项目自带 .venv 重新拉起自己。
+    """用项目自带 .venv 重新拉起自己。
 
     这样双击 main.py、或在任意 python 下运行都能打开，且不往系统环境装东西。
     """
@@ -34,13 +34,17 @@ def _relaunch_in_venv() -> None:
     sys.exit(0)
 
 
+# 不在项目环境里就直接切过去，省掉一次注定失败的 import 尝试（约 100~200ms）
+if not _IN_VENV and (os.path.exists(_VENV_PYW) or os.path.exists(_VENV_PY)):
+    _relaunch_in_venv()
+
+
 try:
+    from PySide6.QtCore import QEventLoop, QEasingCurve, QPropertyAnimation, QTimer
     from PySide6.QtGui import QColor, QFont, QPalette
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 except ModuleNotFoundError:
-    if not _IN_VENV and (os.path.exists(_VENV_PYW) or os.path.exists(_VENV_PY)):
-        _relaunch_in_venv()
     if sys.stderr is not None:
         sys.stderr.write(
             "当前 Python 缺少 PySide6：\n"
@@ -55,6 +59,7 @@ except ModuleNotFoundError:
 import icons
 import theme
 from mainwindow import APP_TITLE, MainWindow
+from splash import Splash
 
 SINGLETON = "ReminderDesk.PySide6.v2"
 
@@ -103,6 +108,18 @@ def _build_tray(app: QApplication, win: MainWindow) -> QSystemTrayIcon | None:
     return tray
 
 
+def _reveal(win: MainWindow, splash: Splash) -> None:
+    """主窗口淡入，启动画面同时淡出。"""
+    anim = QPropertyAnimation(win, b"windowOpacity", win)
+    anim.setDuration(260)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+    anim.finished.connect(lambda: win.setWindowOpacity(1.0))
+    anim.start()
+    splash.finish()
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
@@ -127,19 +144,41 @@ def main() -> int:
     font.setFamilies(["Microsoft YaHei UI", "Segoe UI", "PingFang SC"])
     font.setPixelSize(13)
     app.setFont(font)
-    app.setStyleSheet(theme.qss())
 
     selftest = "--selftest" in sys.argv
     if not selftest and _notify_running_instance():
         return 0
 
-    win = MainWindow()
+    # 启动过渡：主窗口构建要一秒左右，先把启动卡片亮出来，就绪后再淡入
+    splash: Splash | None = None
+    on_stage = None
+    if not selftest:
+        splash = Splash()
+        splash.start()          # 先出卡片骨架，几十毫秒可见
+        splash.reveal_text()    # 再补文字（首次要初始化字体引擎）
+
+        def on_stage(value: float, text: str | None = None) -> None:
+            splash.set_progress(value, text)
+            # 构建期间主线程是占满的，这里主动放行一帧，进度条才动得起来
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    # 全局样式表会触发一遍控件 polish，放到启动画面之后套，免得拖慢第一帧
+    app.setStyleSheet(theme.qss())
+
+    win = MainWindow(on_stage=on_stage)
     tray = _build_tray(app, win)
     win.tray = tray
     if tray is None:
         app.setQuitOnLastWindowClosed(True)
+
+    if splash is not None:
+        win.setWindowOpacity(0.0)
     win.show()
     win.raise_()
+    if splash is not None:
+        QTimer.singleShot(splash.rest_ms(), lambda: _reveal(win, splash))
+        # 兜底：万一淡入动画没跑起来，也不能留一个全透明的窗口
+        QTimer.singleShot(3000, lambda: win.setWindowOpacity(1.0))
 
     # 单实例：后续启动只唤起窗口
     server = QLocalServer()
@@ -153,7 +192,6 @@ def main() -> int:
         server.newConnection.connect(_on_conn)
 
     if selftest:
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(1500, win.quit_app)
 
     code = app.exec()
