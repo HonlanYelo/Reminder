@@ -9,6 +9,7 @@ import json
 import re
 import math
 import time
+import uuid
 import queue
 import ctypes
 import ctypes.wintypes as wt
@@ -122,13 +123,34 @@ def save_config(cfg):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=1)
     except Exception:
-        pass
+        _log_line("保存配置失败: %r" % (sys.exc_info()[1],))
 
 
 def ensure_dir():
     try:
         if not os.path.isdir(DATA_DIR):
             os.makedirs(DATA_DIR)
+    except Exception:
+        pass
+
+
+def _log_line(text):
+    """追加写入 error.log；超过 1MB 清空重写，同时尽力打到 stderr 便于调试"""
+    try:
+        ensure_dir()
+        p = os.path.join(DATA_DIR, "error.log")
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > (1 << 20):
+                os.remove(p)
+        except Exception:
+            pass
+        with open(p, "a", encoding="utf-8") as f:
+            f.write("\n===== %s =====\n%s\n" %
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text))
+    except Exception:
+        pass
+    try:
+        sys.stderr.write(text + "\n")
     except Exception:
         pass
 
@@ -200,8 +222,6 @@ def fmt_due(due):
         pre = "%d月%d日" % (dt.month, dt.day)
     else:
         pre = "%d-%02d-%02d" % (dt.year, dt.month, dt.day)
-    if dt.hour == 0 and dt.minute == 0 and due % 3600 == int(due) and False:
-        pass
     return "%s %02d:%02d" % (pre, dt.hour, dt.minute)
 
 
@@ -219,10 +239,6 @@ def fmt_short(due):
     else:
         pre = "%d/%d " % (dt.month, dt.day)
     return pre + "%02d:%02d" % (dt.hour, dt.minute)
-
-
-def round_rect_id(cv, x1, y1, x2, y2, r, **kw):
-    return rrect(cv, x1, y1, x2, y2, r, **kw)
 
 
 # ----------------------------------------------------------------------------
@@ -358,6 +374,43 @@ def parse_when(text):
 
 
 # ----------------------------------------------------------------------------
+# 标题行内时间提取
+# ----------------------------------------------------------------------------
+_TIME_HINT_RE = re.compile(
+    r"(点|时|分|半|今天|明天|后天|今晚|今夜|明晚|明早|早上|上午|下午|晚上|中午)")
+
+
+def _looks_like_time(s):
+    """粗判一段词是否想表达时间，避免把普通标题误当成时间"""
+    if s.startswith("+"):
+        return True
+    if re.match(r"^\d{3,4}$", s):                              # 0830 / 1830
+        return True
+    if re.match(r"^\d{1,4}[-/.]\d{1,2}([-/.]\d{1,2})?$", s):   # 11-28 / 2026-12-01
+        return True
+    if re.match(r"^\d{1,2}[:：]\d{1,2}$", s):                  # 18:30
+        return True
+    return bool(_TIME_HINT_RE.search(s))
+
+
+def split_time_phrase(text):
+    """标题末尾若带时间短语（如「回电话 明天9点」「整理报告 +2h」）则拆出来。
+    返回 (纯标题, due 秒 或 0)。拆不出来就原样返回，不影响普通标题。"""
+    parts = (text or "").split()
+    for n in (2, 1):          # 先试末尾两词（如「明天 10:00」「11-28 14:00」），再试一词
+        if len(parts) < n:
+            continue
+        cand = " ".join(parts[-n:])
+        if not _looks_like_time(cand):
+            continue
+        dt, _ok = parse_when(cand)
+        if dt is not None:
+            rest = " ".join(parts[:-n]).strip()
+            return (rest or cand), dt.timestamp()
+    return (text or "").strip(), 0
+
+
+# ----------------------------------------------------------------------------
 # 数据
 # ----------------------------------------------------------------------------
 def load_tasks():
@@ -375,9 +428,17 @@ def load_tasks():
                 "notified": bool(t.get("notified")),
                 "created": float(t.get("created") or time.time()),
             })
+        return tasks
+    except FileNotFoundError:
+        return []          # 首次运行，正常
     except Exception:
-        tasks = []
-    return tasks
+        # 文件损坏：先把坏文件备份出来，避免下次保存时无声丢掉全部任务
+        try:
+            os.replace(DATA_FILE, DATA_FILE + ".bad")
+        except Exception:
+            pass
+        _log_line("tasks.json 损坏，已备份为 tasks.json.bad: %r" % (sys.exc_info()[1],))
+        return []
 
 
 def save_tasks(tasks):
@@ -388,11 +449,11 @@ def save_tasks(tasks):
             json.dump({"tasks": tasks, "ver": 1}, f, ensure_ascii=False, indent=1)
         os.replace(tmp, DATA_FILE)
     except Exception:
-        pass
+        _log_line("保存任务失败: %r" % (sys.exc_info()[1],))
 
 
 def new_id():
-    return "%d%04d" % (int(time.time() * 1000), int(time.time() * 7) % 10000)
+    return uuid.uuid4().hex[:16]
 
 
 # ----------------------------------------------------------------------------
@@ -453,6 +514,8 @@ user32.GetParent.argtypes = [wt.HWND]
 user32.GetParent.restype = wt.HWND
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.PostMessageW.restype = wt.BOOL
+user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.PostThreadMessageW.restype = wt.BOOL
 user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
 user32.ShowWindow.restype = wt.BOOL
 user32.SetForegroundWindow.argtypes = [wt.HWND]
@@ -521,16 +584,30 @@ class Tray(object):
         self._cls = "ReminderDeskTrayWnd"
 
     def start(self):
-        try:
-            self._create()
-            self._add()
-            t = threading.Thread(target=self._loop, daemon=True)
-            t.start()
-            self.ok = True
-        except Exception:
-            self.ok = False
+        # 窗口必须创建在泵消息的同一个线程：Win32 把消息投递到创建线程的队列，
+        # 否则 _loop 里的 GetMessageW 收不到任何托盘消息
+        def run():
             try:
-                _log_exc(*sys.exc_info())
+                self._tid = threading.get_ident()
+                self._create()
+                self._add()
+                self.ok = True
+                self._loop()
+            except Exception:
+                self.ok = False
+                try:
+                    _log_exc(*sys.exc_info())
+                except Exception:
+                    pass
+        threading.Thread(target=run, name="tray", daemon=True).start()
+
+    def stop(self):
+        """删除托盘图标并结束托盘线程的消息循环"""
+        self.destroy()
+        tid = getattr(self, "_tid", 0)
+        if tid:
+            try:
+                user32.PostThreadMessageW(tid, 0x0012, 0, 0)   # WM_QUIT
             except Exception:
                 pass
 
@@ -606,7 +683,7 @@ class Tray(object):
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def notify(self, title, text):
-        if not self.ok:
+        if not self.ok or not self.hwnd:
             return
         try:
             nid = NOTIFYICONDATA()
@@ -1795,7 +1872,7 @@ class App(object):
 
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title(WIN_TITLE + "".join([]))
+        self.root.title(WIN_TITLE)
         self.root.configure(bg=C_BG)
         self.root.overrideredirect(True)
 
@@ -1986,7 +2063,7 @@ class App(object):
         inp = tk.Frame(outer, bg=C_BG)
         inp.pack(fill="x", padx=S(16), pady=(S(14), S(4)))
 
-        self.e_title = RoundEntry(inp, "要做什么？例如：给客户回电话", self.f_body,
+        self.e_title = RoundEntry(inp, "要做什么？例如：给客户回电话 明天9点", self.f_body,
                                   height=48, radius=14)
         self.e_title.pack(fill="x")
         self.e_title.entry.bind("<Return>", lambda e: self.add_task())
@@ -2073,13 +2150,15 @@ class App(object):
 
     # ---------------- 逻辑 ----------------
     def add_task(self):
-        title = self.e_title.value()
-        if not title:
+        raw = self.e_title.value()
+        if not raw:
             self._flash("先写一下要做什么吧")
             self.e_title.focus()
             return
 
-        due = self.time_btn.ts or 0
+        # 标题末尾带时间短语（如「回电话 明天9点」）则直接采用；否则用时间选择器
+        title, inline_due = split_time_phrase(raw)
+        due = inline_due or (self.time_btn.ts or 0)
         self.tasks.append({
             "id": new_id(),
             "title": title,
@@ -2104,7 +2183,12 @@ class App(object):
 
     def _flash(self, text):
         self.msg.configure(text=text)
-        self.root.after(2600, lambda: self.msg.configure(text=""))
+        if getattr(self, "_flash_after", None):
+            try:
+                self.root.after_cancel(self._flash_after)
+            except Exception:
+                pass
+        self._flash_after = self.root.after(2600, lambda: self.msg.configure(text=""))
 
     def toggle_task(self, tid):
         for t in self.tasks:
@@ -2249,7 +2333,7 @@ class App(object):
                       fill=C_ACCENT, outline="")
         tk.Label(f, text="还没有任务", font=self.f_body_b, bg=C_BG,
                  fg=C_TEXT).pack(pady=(S(16), 0))
-        tk.Label(f, text="在上面写一条，选个时间，到点会提醒你",
+        tk.Label(f, text="在上面写一条，时间也可以直接带在标题里",
                  font=self.f_small, bg=C_BG, fg=C_DIM).pack(pady=(S(5), 0))
         self.rows.append(f)
 
@@ -2304,7 +2388,7 @@ class App(object):
         except queue.Empty:
             pass
         except Exception:
-            pass
+            _log_exc(*sys.exc_info())
         self.root.after(150, self._poll)
 
     def _popup_menu(self, x, y):
@@ -2436,7 +2520,7 @@ class App(object):
         except Exception:
             pass
         try:
-            self.tray.destroy()
+            self.tray.stop()
         except Exception:
             pass
         try:
@@ -2452,13 +2536,7 @@ class App(object):
 # ----------------------------------------------------------------------------
 def _log_exc(exc_type, exc, tb):
     import traceback
-    try:
-        ensure_dir()
-        with open(os.path.join(DATA_DIR, "error.log"), "a", encoding="utf-8") as f:
-            f.write("\n===== %s =====\n" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            traceback.print_exception(exc_type, exc, tb, file=f)
-    except Exception:
-        pass
+    _log_line("".join(traceback.format_exception(exc_type, exc, tb)))
 
 
 sys.excepthook = _log_exc
